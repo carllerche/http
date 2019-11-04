@@ -1,5 +1,6 @@
 use std::{cmp, fmt, str};
 use std::str::FromStr;
+use std::collections::HashMap;
 
 use bytes::Bytes;
 
@@ -245,6 +246,101 @@ impl PathAndQuery {
             let i = self.query + 1;
             Some(&self.data[i as usize..])
         }
+    }
+
+    /// Parses the query string component into a HashMap (see #query)
+    ///
+    /// This functions splits the query part first by `&` into key-value pairs and
+    /// then splits each pair by `=` into the key and the value. If no `=` is present,
+    /// then an empty vector will be used.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let path_and_query: PathAndQuery = "/hello/world?key=value&foo=bar".parse().unwrap();
+    /// let params = path_and_query.query_params();
+    /// assert_eq!(params.get("foo"), Some(vec!["bar"]));
+    /// ```
+    pub fn query_params(&self) -> HashMap<&str, Vec<&str>> {
+        let qstring = match self.query() {
+            Some(q) => q,
+            None => {
+                return HashMap::new()
+            }
+        };
+
+        let mut r = HashMap::new();
+
+        for kv in qstring.split('&') {
+            let kvvec : Vec<_> = kv.split('=').collect();
+            if kvvec.len() > 2 || kvvec.len() == 0  {
+                panic!("Can not parse key-value pair '{}'", kv);
+            }
+
+            if !r.contains_key(&kvvec[0]) {
+                r.insert(kvvec[0].clone(), vec![kvvec[1].clone()]);
+            } else {
+                let mut nv : Vec<_> = r.get(kvvec[0]).unwrap().clone();
+                nv.push(kvvec[1].clone());
+                r.insert(kvvec[0].clone(), nv);
+            }
+        }
+
+        r
+    }
+
+    /// Parses the query string component and return the values to the given key
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http::uri::*;
+    /// let path_and_query: PathAndQuery = "/hello/world?key=value&foo=bar".parse().unwrap();
+    /// assert_eq!(path_and_query.query_param("foo"), Some("bar"));
+    /// ```
+    pub fn query_param<S: AsRef<str>>(&self, key: S) -> Option<Vec<&str>> {
+        match self.query_params().get(key.as_ref()) {
+            Some(v) => Some(v.clone()),
+            None => None
+        }
+    }
+
+    /// Parses the query string component and return the first value to the given key
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http::uri::*;
+    /// let path_and_query: PathAndQuery = "/hello/world?key=value&foo=bar&foo=baz".parse().unwrap();
+    ///
+    /// assert_eq!(path_and_query.query_param_first("foo"), Some("bar"));
+    /// ```
+    pub fn query_param_first<S: AsRef<str>>(&self, key: S) -> Option<&str> {
+        match self.query_param(key) {
+            Some(vs) => if vs.len() > 0 {
+                Some(vs[0])
+            } else { 
+                None
+            },
+            None => None
+        }
+    }
+
+    /// Parses the query string component and returns `true` if the given key was supplied
+    ///
+    /// # Examples
+    ///
+    /// With a query string component
+    ///
+    /// ```
+    /// # use http::uri::*;
+    /// let path_and_query: PathAndQuery = "/hello/world?key=value&foo=bar".parse().unwrap();
+    ///
+    /// assert!( path_and_query.query_has_key("foo"));
+    /// assert!(!path_and_query.query_has_key("bar"));
+    /// ```
+    pub fn query_contains_key<S: AsRef<str>>(&self, key: S) -> bool {
+        self.query_param(key).is_some()    
     }
 
     /// Returns the path and query as a string component.
