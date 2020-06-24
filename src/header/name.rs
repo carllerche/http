@@ -5,8 +5,9 @@ use std::borrow::Borrow;
 use std::error::Error;
 use std::convert::{TryFrom};
 use std::hash::{Hash, Hasher};
+use std::mem::MaybeUninit;
 use std::str::FromStr;
-use std::{fmt, mem};
+use std::fmt;
 
 /// Represents an HTTP header field name
 ///
@@ -50,6 +51,7 @@ enum Repr<T> {
 struct Custom(ByteStr);
 
 #[derive(Debug, Clone)]
+// Invariant: If lower then buf is valid UTF-8.
 struct MaybeLower<'a> {
     buf: &'a [u8],
     lower: bool,
@@ -978,6 +980,8 @@ standard_headers! {
 ///                      / DIGIT / ALPHA
 ///                      ; any VCHAR, except delimiters
 /// ```
+// HEADER_CHARS maps every byte that is 128 or larger to 0 so everything that is
+// mapped by HEADER_CHARS, maps to a valid single-byte UTF-8 codepoint.
 const HEADER_CHARS: [u8; 256] = [
     //  0      1      2      3      4      5      6      7      8      9
         0,     0,     0,     0,     0,     0,     0,     0,     0,     0, //   x
@@ -1009,6 +1013,8 @@ const HEADER_CHARS: [u8; 256] = [
 ];
 
 /// Valid header name characters for HTTP/2.0 and HTTP/3.0
+// HEADER_CHARS_H2 maps every byte that is 128 or larger to 0 so everything that is
+// mapped by HEADER_CHARS_H2, maps to a valid single-byte UTF-8 codepoint.
 const HEADER_CHARS_H2: [u8; 256] = [
     //  0      1      2      3      4      5      6      7      8      9
         0,     0,     0,     0,     0,     0,     0,     0,     0,     0, //   x
@@ -1040,95 +1046,129 @@ const HEADER_CHARS_H2: [u8; 256] = [
 ];
 
 #[cfg(any(not(debug_assertions), not(target_arch = "wasm32")))]
-macro_rules! eq {
-    (($($cmp:expr,)*) $v:ident[$n:expr] ==) => {
-        $($cmp) && *
-    };
-    (($($cmp:expr,)*) $v:ident[$n:expr] == $a:tt $($rest:tt)*) => {
-        eq!(($($cmp,)* $v[$n] == $a,) $v[$n+1] == $($rest)*)
-    };
-    ($v:ident == $($rest:tt)+) => {
-        eq!(() $v[0] == $($rest)+)
-    };
-    ($v:ident[$n:expr] == $($rest:tt)+) => {
-        eq!(() $v[$n] == $($rest)+)
-    };
-}
-
-#[cfg(any(not(debug_assertions), not(target_arch = "wasm32")))]
 /// This version is best under optimized mode, however in a wasm debug compile,
 /// the `eq` macro expands to 1 + 1 + 1 + 1... and wasm explodes when this chain gets too long
 /// See https://github.com/DenisKolodin/yew/issues/478
+// Precondition: table maps all bytes that are not valid single-byte UTF-8 to something that is.
 fn parse_hdr<'a>(
     data: &'a [u8],
-    b: &'a mut [u8; 64],
+    b: &'a mut [MaybeUninit<u8>; SCRATCH_BUF_SIZE],
     table: &[u8; 256],
 ) -> Result<HdrName<'a>, InvalidHeaderName> {
     use self::StandardHeader::*;
 
     let len = data.len();
 
-    let validate = |buf: &'a [u8], len: usize| {
-        let buf = &buf[..len];
+    // Precondition: each element of buf must be intitialized and must be 
+    // a valid single-byte UTF-8 codepoint.
+    let validate = |buf: &'a [MaybeUninit<u8>]| {
+        // Safety: follows from the precondtion
+        let buf = unsafe {slice_assume_init(buf)};
         if buf.iter().any(|&b| b == 0) {
             Err(InvalidHeaderName::new())
         } else {
+            // Precondition: satified by the precondition of validate.
             Ok(HdrName::custom(buf, true))
         }
     };
 
+    // Called as either eq!(b == b'a' b'b' b'c') or eq!(b[i] == b'a' b'b' b'c')
+    // Precondition: the first n elements of b (or the first n starting at i) must be
+    // intitialized, where n is the number of bytes listed after the '==' in the
+    // invocation.
+    macro_rules! eq {
+        (($($cmp:expr,)*) $v:ident[$n:expr] ==) => {
+            $($cmp) && *
+        };
+        (($($cmp:expr,)*) $v:ident[$n:expr] == $a:tt $($rest:tt)*) => {
+            // Safety: this arm is matched once for each byte after the '==' in the
+            // invocation (starting at 0 or i depending on the form of the call).  By
+            // the precondtion $v[$n] is intitialized for each such match.
+            eq!(($($cmp,)* unsafe {*($v[$n].as_ptr())} == $a ,) $v[$n+1] ==
+                $($rest)*)
+        };
+        ($v:ident == $($rest:tt)+) => {
+            eq!(() $v[0] == $($rest)+)
+        };
+        ($v:ident[$n:expr] == $($rest:tt)+) => {
+            eq!(() $v[$n] == $($rest)+)
+        };
+    }
 
+    // Post-condition: the first n elements of $d are intitialized to a valid
+    // single-byte UTF-8 codepoint where n is the third paramter to the macro. Note
+    // that this macro overwrite the first n elements of $d without dropping the
+    // existing contents (if any) but the elements of $d are u8's so no drop is
+    // necessary. The UTF-8 part of the post-condition follows from the precondition
+    // on table that is a part of parse_hdr().
     macro_rules! to_lower {
-        ($d:ident, $src:ident, 1) => { $d[0] = table[$src[0] as usize]; };
-        ($d:ident, $src:ident, 2) => { to_lower!($d, $src, 1); $d[1] = table[$src[1] as usize]; };
-        ($d:ident, $src:ident, 3) => { to_lower!($d, $src, 2); $d[2] = table[$src[2] as usize]; };
-        ($d:ident, $src:ident, 4) => { to_lower!($d, $src, 3); $d[3] = table[$src[3] as usize]; };
-        ($d:ident, $src:ident, 5) => { to_lower!($d, $src, 4); $d[4] = table[$src[4] as usize]; };
-        ($d:ident, $src:ident, 6) => { to_lower!($d, $src, 5); $d[5] = table[$src[5] as usize]; };
-        ($d:ident, $src:ident, 7) => { to_lower!($d, $src, 6); $d[6] = table[$src[6] as usize]; };
-        ($d:ident, $src:ident, 8) => { to_lower!($d, $src, 7); $d[7] = table[$src[7] as usize]; };
-        ($d:ident, $src:ident, 9) => { to_lower!($d, $src, 8); $d[8] = table[$src[8] as usize]; };
-        ($d:ident, $src:ident, 10) => { to_lower!($d, $src, 9); $d[9] = table[$src[9] as usize]; };
-        ($d:ident, $src:ident, 11) => { to_lower!($d, $src, 10); $d[10] = table[$src[10] as usize]; };
-        ($d:ident, $src:ident, 12) => { to_lower!($d, $src, 11); $d[11] = table[$src[11] as usize]; };
-        ($d:ident, $src:ident, 13) => { to_lower!($d, $src, 12); $d[12] = table[$src[12] as usize]; };
-        ($d:ident, $src:ident, 14) => { to_lower!($d, $src, 13); $d[13] = table[$src[13] as usize]; };
-        ($d:ident, $src:ident, 15) => { to_lower!($d, $src, 14); $d[14] = table[$src[14] as usize]; };
-        ($d:ident, $src:ident, 16) => { to_lower!($d, $src, 15); $d[15] = table[$src[15] as usize]; };
-        ($d:ident, $src:ident, 17) => { to_lower!($d, $src, 16); $d[16] = table[$src[16] as usize]; };
-        ($d:ident, $src:ident, 18) => { to_lower!($d, $src, 17); $d[17] = table[$src[17] as usize]; };
-        ($d:ident, $src:ident, 19) => { to_lower!($d, $src, 18); $d[18] = table[$src[18] as usize]; };
-        ($d:ident, $src:ident, 20) => { to_lower!($d, $src, 19); $d[19] = table[$src[19] as usize]; };
-        ($d:ident, $src:ident, 21) => { to_lower!($d, $src, 20); $d[20] = table[$src[20] as usize]; };
-        ($d:ident, $src:ident, 22) => { to_lower!($d, $src, 21); $d[21] = table[$src[21] as usize]; };
-        ($d:ident, $src:ident, 23) => { to_lower!($d, $src, 22); $d[22] = table[$src[22] as usize]; };
-        ($d:ident, $src:ident, 24) => { to_lower!($d, $src, 23); $d[23] = table[$src[23] as usize]; };
-        ($d:ident, $src:ident, 25) => { to_lower!($d, $src, 24); $d[24] = table[$src[24] as usize]; };
-        ($d:ident, $src:ident, 26) => { to_lower!($d, $src, 25); $d[25] = table[$src[25] as usize]; };
-        ($d:ident, $src:ident, 27) => { to_lower!($d, $src, 26); $d[26] = table[$src[26] as usize]; };
-        ($d:ident, $src:ident, 28) => { to_lower!($d, $src, 27); $d[27] = table[$src[27] as usize]; };
-        ($d:ident, $src:ident, 29) => { to_lower!($d, $src, 28); $d[28] = table[$src[28] as usize]; };
-        ($d:ident, $src:ident, 30) => { to_lower!($d, $src, 29); $d[29] = table[$src[29] as usize]; };
-        ($d:ident, $src:ident, 31) => { to_lower!($d, $src, 30); $d[30] = table[$src[30] as usize]; };
-        ($d:ident, $src:ident, 32) => { to_lower!($d, $src, 31); $d[31] = table[$src[31] as usize]; };
-        ($d:ident, $src:ident, 33) => { to_lower!($d, $src, 32); $d[32] = table[$src[32] as usize]; };
-        ($d:ident, $src:ident, 34) => { to_lower!($d, $src, 33); $d[33] = table[$src[33] as usize]; };
-        ($d:ident, $src:ident, 35) => { to_lower!($d, $src, 34); $d[34] = table[$src[34] as usize]; };
+        ($d:ident, $src:ident, 1) => { $d[0] = MaybeUninit::new(table[$src[0] as usize]); };
+        ($d:ident, $src:ident, 2) => { to_lower!($d, $src, 1); $d[1] = MaybeUninit::new(table[$src[1] as usize]); };
+        ($d:ident, $src:ident, 3) => { to_lower!($d, $src, 2); $d[2] = MaybeUninit::new(table[$src[2] as usize]); };
+        ($d:ident, $src:ident, 4) => { to_lower!($d, $src, 3); $d[3] = MaybeUninit::new(table[$src[3] as usize]); };
+        ($d:ident, $src:ident, 5) => { to_lower!($d, $src, 4); $d[4] = MaybeUninit::new(table[$src[4] as usize]); };
+        ($d:ident, $src:ident, 6) => { to_lower!($d, $src, 5); $d[5] = MaybeUninit::new(table[$src[5] as usize]); };
+        ($d:ident, $src:ident, 7) => { to_lower!($d, $src, 6); $d[6] = MaybeUninit::new(table[$src[6] as usize]); };
+        ($d:ident, $src:ident, 8) => { to_lower!($d, $src, 7); $d[7] = MaybeUninit::new(table[$src[7] as usize]); };
+        ($d:ident, $src:ident, 9) => { to_lower!($d, $src, 8); $d[8] = MaybeUninit::new(table[$src[8] as usize]); };
+        ($d:ident, $src:ident, 10) => { to_lower!($d, $src, 9); $d[9] = MaybeUninit::new(table[$src[9] as usize]); };
+        ($d:ident, $src:ident, 11) => { to_lower!($d, $src, 10); $d[10] = MaybeUninit::new(table[$src[10] as usize]); };
+        ($d:ident, $src:ident, 12) => { to_lower!($d, $src, 11); $d[11] = MaybeUninit::new(table[$src[11] as usize]); };
+        ($d:ident, $src:ident, 13) => { to_lower!($d, $src, 12); $d[12] = MaybeUninit::new(table[$src[12] as usize]); };
+        ($d:ident, $src:ident, 14) => { to_lower!($d, $src, 13); $d[13] = MaybeUninit::new(table[$src[13] as usize]); };
+        ($d:ident, $src:ident, 15) => { to_lower!($d, $src, 14); $d[14] = MaybeUninit::new(table[$src[14] as usize]); };
+        ($d:ident, $src:ident, 16) => { to_lower!($d, $src, 15); $d[15] = MaybeUninit::new(table[$src[15] as usize]); };
+        ($d:ident, $src:ident, 17) => { to_lower!($d, $src, 16); $d[16] = MaybeUninit::new(table[$src[16] as usize]); };
+        ($d:ident, $src:ident, 18) => { to_lower!($d, $src, 17); $d[17] = MaybeUninit::new(table[$src[17] as usize]); };
+        ($d:ident, $src:ident, 19) => { to_lower!($d, $src, 18); $d[18] = MaybeUninit::new(table[$src[18] as usize]); };
+        ($d:ident, $src:ident, 20) => { to_lower!($d, $src, 19); $d[19] = MaybeUninit::new(table[$src[19] as usize]); };
+        ($d:ident, $src:ident, 21) => { to_lower!($d, $src, 20); $d[20] = MaybeUninit::new(table[$src[20] as usize]); };
+        ($d:ident, $src:ident, 22) => { to_lower!($d, $src, 21); $d[21] = MaybeUninit::new(table[$src[21] as usize]); };
+        ($d:ident, $src:ident, 23) => { to_lower!($d, $src, 22); $d[22] = MaybeUninit::new(table[$src[22] as usize]); };
+        ($d:ident, $src:ident, 24) => { to_lower!($d, $src, 23); $d[23] = MaybeUninit::new(table[$src[23] as usize]); };
+        ($d:ident, $src:ident, 25) => { to_lower!($d, $src, 24); $d[24] = MaybeUninit::new(table[$src[24] as usize]); };
+        ($d:ident, $src:ident, 26) => { to_lower!($d, $src, 25); $d[25] = MaybeUninit::new(table[$src[25] as usize]); };
+        ($d:ident, $src:ident, 27) => { to_lower!($d, $src, 26); $d[26] = MaybeUninit::new(table[$src[26] as usize]); };
+        ($d:ident, $src:ident, 28) => { to_lower!($d, $src, 27); $d[27] = MaybeUninit::new(table[$src[27] as usize]); };
+        ($d:ident, $src:ident, 29) => { to_lower!($d, $src, 28); $d[28] = MaybeUninit::new(table[$src[28] as usize]); };
+        ($d:ident, $src:ident, 30) => { to_lower!($d, $src, 29); $d[29] = MaybeUninit::new(table[$src[29] as usize]); };
+        ($d:ident, $src:ident, 31) => { to_lower!($d, $src, 30); $d[30] = MaybeUninit::new(table[$src[30] as usize]); };
+        ($d:ident, $src:ident, 32) => { to_lower!($d, $src, 31); $d[31] = MaybeUninit::new(table[$src[31] as usize]); };
+        ($d:ident, $src:ident, 33) => { to_lower!($d, $src, 32); $d[32] = MaybeUninit::new(table[$src[32] as usize]); };
+        ($d:ident, $src:ident, 34) => { to_lower!($d, $src, 33); $d[33] = MaybeUninit::new(table[$src[33] as usize]); };
+        ($d:ident, $src:ident, 35) => { to_lower!($d, $src, 34); $d[34] = MaybeUninit::new(table[$src[34] as usize]); };
     }
 
     assert!(len < super::MAX_HEADER_NAME_LEN,
             "header name too long -- max length is {}",
             super::MAX_HEADER_NAME_LEN);
 
+    // Most of the arms of the match below have a variation of the following pattern:
+    //      to_lower!(b, data, n);
+    //      if eq!(b == b'1' b'2' ... b'n') {
+    //          Ok(StandardHeaderElement.into())
+    //      } else {
+    //          validate(&b[..n])
+    //      }
+    // The soundness of the arms following this pattern is described once in the
+    // match arm for 2. The soundness of exception to this pattern are described in
+    // each such match arm.
     match len {
         0 => Err(InvalidHeaderName::new()),
         2 => {
             to_lower!(b, data, 2);
 
+            // Precondition: the post-condition on to_lower!() ensures the first 2
+            // elements of b are intitialized and the eq!() call lists 2 bytes
+            // after the ==.
             if eq!(b == b't' b'e') {
                 Ok(Te.into())
             } else {
-                validate(b, len)
+                // Precondition: the post-condition on to_lower!() ensures that the
+                // first 2 elements of b are intitialized and are valid single-byte
+                // UTF-8. len == 2 so all of b[..len] is intitialized and is valid
+                // UTF-8.
+                validate(&b[..len])
             }
         }
         3 => {
@@ -1141,7 +1181,7 @@ fn parse_hdr<'a>(
             } else if eq!(b == b'd' b'n' b't') {
                 Ok(Dnt.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         4 => {
@@ -1160,7 +1200,7 @@ fn parse_hdr<'a>(
             } else if eq!(b == b'v' b'a' b'r' b'y') {
                 Ok(Vary.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         5 => {
@@ -1171,10 +1211,11 @@ fn parse_hdr<'a>(
             } else if eq!(b == b'r' b'a' b'n' b'g' b'e') {
                 Ok(Range.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         6 => {
+            // this arm mostly follows the pattern except as indicated
             to_lower!(b, data, 6);
 
             if eq!(b == b'a' b'c' b'c' b'e' b'p' b't') {
@@ -1187,13 +1228,18 @@ fn parse_hdr<'a>(
                 return Ok(Origin.into());
             } else if eq!(b == b'p' b'r' b'a' b'g' b'm' b'a') {
                 return Ok(Pragma.into());
-            } else if b[0] == b's' {
+            // Safety: the post-condtion on to_lower!() means the first 6
+            // elements of b are intitialized so, in particular, b[0] is.
+            } else if unsafe {*(b[0].as_ptr())} == b's' {
+                // Precondition: the post-condtion on to_lower!() means the
+                // first 6 elements of b (and hence the first 5 elements starting
+                // at b[1]) are intitialized.
                 if eq!(b[1] == b'e' b'r' b'v' b'e' b'r') {
                     return Ok(Server.into());
                 }
             }
 
-            validate(b, len)
+            validate(&b[..len])
         }
         7 => {
             to_lower!(b, data, 7);
@@ -1213,13 +1259,17 @@ fn parse_hdr<'a>(
             } else if eq!(b == b'w' b'a' b'r' b'n' b'i' b'n' b'g') {
                 Ok(Warning.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         8 => {
             to_lower!(b, data, 8);
 
+            // Precondition: the post-condition on to_lower!() means the first
+            // 8 elements of b are intitialized so, in particular, the first 3 are.
             if eq!(b == b'i' b'f' b'-') {
+                // Precondition: (here and next eq!()) the first 5 elements of b
+                // starting at b[3] are intitialized because the first 8 are.
                 if eq!(b[3] == b'm' b'a' b't' b'c' b'h') {
                     return Ok(IfMatch.into());
                 } else if eq!(b[3] == b'r' b'a' b'n' b'g' b'e') {
@@ -1229,7 +1279,7 @@ fn parse_hdr<'a>(
                 return Ok(Location.into());
             }
 
-            validate(b, len)
+            validate(&b[..len])
         }
         9 => {
             to_lower!(b, data, 9);
@@ -1237,7 +1287,7 @@ fn parse_hdr<'a>(
             if eq!(b == b'f' b'o' b'r' b'w' b'a' b'r' b'd' b'e' b'd') {
                 Ok(Forwarded.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         10 => {
@@ -1250,7 +1300,7 @@ fn parse_hdr<'a>(
             } else if eq!(b == b'u' b's' b'e' b'r' b'-' b'a' b'g' b'e' b'n' b't') {
                 Ok(UserAgent.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         11 => {
@@ -1259,7 +1309,7 @@ fn parse_hdr<'a>(
             if eq!(b == b'r' b'e' b't' b'r' b'y' b'-' b'a' b'f' b't' b'e' b'r') {
                 Ok(RetryAfter.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         12 => {
@@ -1270,19 +1320,24 @@ fn parse_hdr<'a>(
             } else if eq!(b == b'm' b'a' b'x' b'-' b'f' b'o' b'r' b'w' b'a' b'r' b'd' b's') {
                 Ok(MaxForwards.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         13 => {
             to_lower!(b, data, 13);
 
-            if b[0] == b'a' {
+            // Safety: (here and next else if) The post-condition on to_lower!() 
+            // means the first 13 bytes of b are intitialized so b[0] is.
+            if unsafe {*(b[0].as_ptr())} == b'a' {
+                // Precondition: (here and next calls of eq!() with b[1]) the 
+                // first 13 bytes of b are intitialized so the first 12 starting
+                // at b[1] are.
                 if eq!(b[1] == b'c' b'c' b'e' b'p' b't' b'-' b'r' b'a' b'n' b'g' b'e' b's') {
                     return Ok(AcceptRanges.into());
                 } else if eq!(b[1] == b'u' b't' b'h' b'o' b'r' b'i' b'z' b'a' b't' b'i' b'o' b'n') {
                     return Ok(Authorization.into());
                 }
-            } else if b[0] == b'c' {
+            } else if unsafe {*(b[0].as_ptr())} == b'c' {
                 if eq!(b[1] == b'a' b'c' b'h' b'e' b'-' b'c' b'o' b'n' b't' b'r' b'o' b'l') {
                     return Ok(CacheControl.into());
                 } else if eq!(b[1] == b'o' b'n' b't' b'e' b'n' b't' b'-' b'r' b'a' b'n' b'g' b'e' )
@@ -1295,7 +1350,7 @@ fn parse_hdr<'a>(
                 return Ok(LastModified.into());
             }
 
-            validate(b, len)
+            validate(&b[..len])
         }
         14 => {
             to_lower!(b, data, 14);
@@ -1306,13 +1361,17 @@ fn parse_hdr<'a>(
             {
                 Ok(ContentLength.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         15 => {
             to_lower!(b, data, 15);
 
+            // Precondition: The post-condition on to_lower!() ensures the first 15 
+            // bytes of b are intitialized so, in particular the first 7 are.
             if eq!(b == b'a' b'c' b'c' b'e' b'p' b't' b'-') { // accept-
+                // Precondition: The first 15 bytes of b are intitialized so the
+                // first 8 starting at b[7] are.
                 if eq!(b[7] == b'e' b'n' b'c' b'o' b'd' b'i' b'n' b'g') {
                     return Ok(AcceptEncoding.into())
                 } else if eq!(b[7] == b'l' b'a' b'n' b'g' b'u' b'a' b'g' b'e') {
@@ -1327,12 +1386,17 @@ fn parse_hdr<'a>(
                 return Ok(ReferrerPolicy.into())
             }
 
-            validate(b, len)
+            validate(&b[..len])
         }
         16 => {
             to_lower!(b, data, 16);
 
+            // Precondition: The post-condition on to_lower!() means that the first 
+            // 16 bytes of b are intitialized so, in particular, the first 8 bytes
+            // are.
             if eq!(b == b'c' b'o' b'n' b't' b'e' b'n' b't' b'-') {
+                // Precondition: The first 16 bytes of b are intitialized so the
+                // first 8 bytes starting at b[8] are.
                 if eq!(b[8] == b'l' b'a' b'n' b'g' b'u' b'a' b'g' b'e') {
                     return Ok(ContentLanguage.into())
                 } else if eq!(b[8] == b'l' b'o' b'c' b'a' b't' b'i' b'o' b'n') {
@@ -1346,7 +1410,7 @@ fn parse_hdr<'a>(
                 return Ok(XXssProtection.into())
             }
 
-            validate(b, len)
+            validate(&b[..len])
         }
         17 => {
             to_lower!(b, data, 17);
@@ -1358,7 +1422,7 @@ fn parse_hdr<'a>(
             } else if eq!(b == b's' b'e' b'c' b'-' b'w' b'e' b'b' b's' b'o' b'c' b'k' b'e' b't' b'-' b'k' b'e' b'y') {
                 Ok(SecWebSocketKey.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         18 => {
@@ -1367,7 +1431,7 @@ fn parse_hdr<'a>(
             if eq!(b == b'p' b'r' b'o' b'x' b'y' b'-' b'a' b'u' b't' b'h' b'e' b'n' b't' b'i' b'c' b'a' b't' b'e') {
                 Ok(ProxyAuthenticate.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         19 => {
@@ -1380,7 +1444,7 @@ fn parse_hdr<'a>(
             } else if eq!(b == b'p' b'r' b'o' b'x' b'y' b'-' b'a' b'u' b't' b'h' b'o' b'r' b'i' b'z' b'a' b't' b'i' b'o' b'n') {
                 Ok(ProxyAuthorization.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         20 => {
@@ -1389,7 +1453,7 @@ fn parse_hdr<'a>(
             if eq!(b == b's' b'e' b'c' b'-' b'w' b'e' b'b' b's' b'o' b'c' b'k' b'e' b't' b'-' b'a' b'c' b'c' b'e' b'p' b't') {
                 Ok(SecWebSocketAccept.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         21 => {
@@ -1398,7 +1462,7 @@ fn parse_hdr<'a>(
             if eq!(b == b's' b'e' b'c' b'-' b'w' b'e' b'b' b's' b'o' b'c' b'k' b'e' b't' b'-' b'v' b'e' b'r' b's' b'i' b'o' b'n') {
                 Ok(SecWebSocketVersion.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         22 => {
@@ -1413,7 +1477,7 @@ fn parse_hdr<'a>(
             } else if eq!(b == b's' b'e' b'c' b'-' b'w' b'e' b'b' b's' b'o' b'c' b'k' b'e' b't' b'-' b'p' b'r' b'o' b't' b'o' b'c' b'o' b'l') {
                 Ok(SecWebSocketProtocol.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         23 => {
@@ -1422,7 +1486,7 @@ fn parse_hdr<'a>(
             if eq!(b == b'c' b'o' b'n' b't' b'e' b'n' b't' b'-' b's' b'e' b'c' b'u' b'r' b'i' b't' b'y' b'-' b'p' b'o' b'l' b'i' b'c' b'y') {
                 Ok(ContentSecurityPolicy.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         24 => {
@@ -1431,7 +1495,7 @@ fn parse_hdr<'a>(
             if eq!(b == b's' b'e' b'c' b'-' b'w' b'e' b'b' b's' b'o' b'c' b'k' b'e' b't' b'-' b'e' b'x' b't' b'e' b'n' b's' b'i' b'o' b'n' b's') {
                 Ok(SecWebSocketExtensions.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         25 => {
@@ -1442,7 +1506,7 @@ fn parse_hdr<'a>(
             } else if eq!(b == b'u' b'p' b'g' b'r' b'a' b'd' b'e' b'-' b'i' b'n' b's' b'e' b'c' b'u' b'r' b'e' b'-' b'r' b'e' b'q' b'u' b'e' b's' b't' b's') {
                 Ok(UpgradeInsecureRequests.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         27 => {
@@ -1453,13 +1517,17 @@ fn parse_hdr<'a>(
             } else if eq!(b == b'p' b'u' b'b' b'l' b'i' b'c' b'-' b'k' b'e' b'y' b'-' b'p' b'i' b'n' b's' b'-' b'r' b'e' b'p' b'o' b'r' b't' b'-' b'o' b'n' b'l' b'y') {
                 Ok(PublicKeyPinsReportOnly.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         28 => {
             to_lower!(b, data, 28);
 
+            // Precondition: The post-condition of to_lower!() ensures that the first 28 bytes of b
+            // are intitialized so, in particular, the first 21 are.
             if eq!(b == b'a' b'c' b'c' b'e' b's' b's' b'-' b'c' b'o' b'n' b't' b'r' b'o' b'l' b'-' b'a' b'l' b'l' b'o' b'w' b'-') {
+                // Precondition: The first 28 bytes of b are intitialized so the first 7 bytes
+                // starting at b[21] are.
                 if eq!(b[21] == b'h' b'e' b'a' b'd' b'e' b'r' b's') {
                     return Ok(AccessControlAllowHeaders.into())
                 } else if eq!(b[21] == b'm' b'e' b't' b'h' b'o' b'd' b's') {
@@ -1467,12 +1535,16 @@ fn parse_hdr<'a>(
                 }
             }
 
-            validate(b, len)
+            validate(&b[..len])
         }
         29 => {
             to_lower!(b, data, 29);
 
+            // Precondition: The post-condition of to_lower!() ensures the fist 29 bytes of b are
+            // intitialized so, in particular, the first 15 bytes are.
             if eq!(b == b'a' b'c' b'c' b'e' b's' b's' b'-' b'c' b'o' b'n' b't' b'r' b'o' b'l' b'-') {
+                // Precondition: The fisr 29 bytes of b are intitialized so the first 14 bytes
+                // starting at b[15] are.
                 if eq!(b[15] == b'e' b'x' b'p' b'o' b's' b'e' b'-' b'h' b'e' b'a' b'd' b'e' b'r' b's') {
                     return Ok(AccessControlExposeHeaders.into())
                 } else if eq!(b[15] == b'r' b'e' b'q' b'u' b'e' b's' b't' b'-' b'm' b'e' b't' b'h' b'o' b'd') {
@@ -1480,7 +1552,7 @@ fn parse_hdr<'a>(
                 }
             }
 
-            validate(b, len)
+            validate(&b[..len])
         }
         30 => {
             to_lower!(b, data, 30);
@@ -1488,7 +1560,7 @@ fn parse_hdr<'a>(
             if eq!(b == b'a' b'c' b'c' b'e' b's' b's' b'-' b'c' b'o' b'n' b't' b'r' b'o' b'l' b'-' b'r' b'e' b'q' b'u' b'e' b's' b't' b'-' b'h' b'e' b'a' b'd' b'e' b'r' b's') {
                 Ok(AccessControlRequestHeaders.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         32 => {
@@ -1497,7 +1569,7 @@ fn parse_hdr<'a>(
             if eq!(b == b'a' b'c' b'c' b'e' b's' b's' b'-' b'c' b'o' b'n' b't' b'r' b'o' b'l' b'-' b'a' b'l' b'l' b'o' b'w' b'-' b'c' b'r' b'e' b'd' b'e' b'n' b't' b'i' b'a' b'l' b's') {
                 Ok(AccessControlAllowCredentials.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         35 => {
@@ -1506,16 +1578,20 @@ fn parse_hdr<'a>(
             if eq!(b == b'c' b'o' b'n' b't' b'e' b'n' b't' b'-' b's' b'e' b'c' b'u' b'r' b'i' b't' b'y' b'-' b'p' b'o' b'l' b'i' b'c' b'y' b'-' b'r' b'e' b'p' b'o' b'r' b't' b'-' b'o' b'n' b'l' b'y') {
                 Ok(ContentSecurityPolicyReportOnly.into())
             } else {
-                validate(b, len)
+                validate(&b[..len])
             }
         }
         _ => {
             if len < 64 {
                 for i in 0..len {
-                    b[i] = table[data[i] as usize];
+                    // The precondition on table for parse_hdr() means that b[i] is
+                    // intitialized to a valid single-byte UTF-8 codepoint.
+                    b[i] = MaybeUninit::new(table[data[i] as usize]);
                 }
 
-                validate(b, len)
+                // Precondition: the first len bytes of b are intitialized in the loop above so
+                // b[..len] is intitialized and is valid UTF-8.
+                validate(&b[..len])
             } else {
                 Ok(HdrName::custom(data, false))
             }
@@ -1525,20 +1601,23 @@ fn parse_hdr<'a>(
 
 #[cfg(all(debug_assertions, target_arch = "wasm32"))]
 /// This version works best in debug mode in wasm
+// Precondition: table maps all bytes that are not valid single-byte UTF-8 to something that is.
 fn parse_hdr<'a>(
     data: &'a [u8],
-    b: &'a mut [u8; 64],
+    b: &'a mut [MaybeUninit<u8>; SCRATCH_BUF_SIZE],
     table: &[u8; 256],
 ) -> Result<HdrName<'a>, InvalidHeaderName> {
     use self::StandardHeader::*;
 
     let len = data.len();
 
+    // Precondition: the first len bytes of buf are valid UTF-8.
     let validate = |buf: &'a [u8], len: usize| {
         let buf = &buf[..len];
         if buf.iter().any(|&b| b == 0) {
             Err(InvalidHeaderName::new())
         } else {
+            // Precondition: follows from the precondtion on validate.
             Ok(HdrName::custom(buf, true))
         }
     };
@@ -1553,8 +1632,16 @@ fn parse_hdr<'a>(
         0 => Err(InvalidHeaderName::new()),
         len if len > 64 => Ok(HdrName::custom(data, false)),
         len => {
-            // Read from data into the buffer - transforming using `table` as we go
-            data.iter().zip(b.iter_mut()).for_each(|(index, out)| *out = table[*index as usize]);
+            // Read from data into the buffer - transforming using `table` as we go.
+            // The assignment to *out ensures that each byte is intitialized. Since
+            // *out is a u8 it doesn't matter that we are not dropping *out before
+            // accessing it. The precondition on table for parse_hdr() means that
+            // each intitialized byte of b is valid UTF-8.
+            data.iter().zip(b.iter_mut()).for_each(|(index, out)| *out =
+                                                   MaybeUninit::new(table[*index as
+                                                                    usize]));
+            // Safety: We just intitialized the first len bytes of b in the previous line.
+            let b = unsafe {slice_assume_init(&b[..len])};
             match &b[0..len] {
                 b"te" => Ok(Te.into()),
                 b"age" => Ok(Age.into()),
@@ -1637,6 +1724,8 @@ fn parse_hdr<'a>(
                 b"content-security-policy-report-only" => {
                     Ok(ContentSecurityPolicyReportOnly.into())
                 }
+                // Precondition: other is the first len bytes of b which was
+                // initialized to valid UTF-8 above.
                 other => validate(other, len),
             }
         }
@@ -1655,14 +1744,14 @@ impl HeaderName {
     /// Converts a slice of bytes to an HTTP header name.
     ///
     /// This function normalizes the input.
-    #[allow(deprecated)]
     pub fn from_bytes(src: &[u8]) -> Result<HeaderName, InvalidHeaderName> {
-        #[allow(deprecated)]
-        let mut buf = unsafe { mem::uninitialized() };
+        let mut buf = uninit_u8_array();
+        // Precondition: HEADER_CHARS is a valid table for parse_hdr().
         match parse_hdr(src, &mut buf, &HEADER_CHARS)?.inner {
             Repr::Standard(std) => Ok(std.into()),
             Repr::Custom(MaybeLower { buf, lower: true }) => {
                 let buf = Bytes::copy_from_slice(buf);
+                // Safety: the invariant on MaybeLower ensures buf is valid UTF-8.
                 let val = unsafe { ByteStr::from_utf8_unchecked(buf) };
                 Ok(Custom(val).into())
             }
@@ -1671,6 +1760,7 @@ impl HeaderName {
                 let mut dst = BytesMut::with_capacity(buf.len());
 
                 for b in buf.iter() {
+                    // HEADER_CHARS maps all bytes to valid single-byte UTF-8
                     let b = HEADER_CHARS[*b as usize];
 
                     if b == 0 {
@@ -1680,6 +1770,9 @@ impl HeaderName {
                     dst.put_u8(b);
                 }
 
+                // Safety: the loop above maps all bytes in buf to valid single byte
+                // UTF-8 before copying them into dst. This means that dst (and hence
+                // dst.freeze()) is valid UTF-8.
                 let val = unsafe { ByteStr::from_utf8_unchecked(dst.freeze()) };
 
                 Ok(Custom(val).into())
@@ -1705,25 +1798,29 @@ impl HeaderName {
     /// // Parsing a header that contains uppercase characters
     /// assert!(HeaderName::from_lowercase(b"Content-Length").is_err());
     /// ```
-    #[allow(deprecated)]
     pub fn from_lowercase(src: &[u8]) -> Result<HeaderName, InvalidHeaderName> {
-        #[allow(deprecated)]
-        let mut buf = unsafe { mem::uninitialized() };
+        let mut buf = uninit_u8_array();
+        // Precondition: HEADER_CHARS_H2 is a valid table for parse_hdr()
         match parse_hdr(src, &mut buf, &HEADER_CHARS_H2)?.inner {
             Repr::Standard(std) => Ok(std.into()),
             Repr::Custom(MaybeLower { buf, lower: true }) => {
                 let buf = Bytes::copy_from_slice(buf);
+                // Safety: the invariant on MaybeLower ensures buf is valid UTF-8.
                 let val = unsafe { ByteStr::from_utf8_unchecked(buf) };
                 Ok(Custom(val).into())
             }
             Repr::Custom(MaybeLower { buf, lower: false }) => {
                 for &b in buf.iter() {
+                    // HEADER_CHARS maps all bytes that are not valid single-byte
+                    // UTF-8 to 0 so this check returns an error for invalid UTF-8.
                     if b != HEADER_CHARS[b as usize] {
                         return Err(InvalidHeaderName::new());
                     }
                 }
 
                 let buf = Bytes::copy_from_slice(buf);
+                // Safety: the loop above checks that each byte of buf (either
+                // version) is valid UTF-8.
                 let val = unsafe { ByteStr::from_utf8_unchecked(buf) };
                 Ok(Custom(val).into())
             }
@@ -1765,11 +1862,10 @@ impl HeaderName {
     /// let a = HeaderName::from_static("foobar");
     /// let b = HeaderName::from_static("FOOBAR"); // This line panics!
     /// ```
-    #[allow(deprecated)]
     pub fn from_static(src: &'static str) -> HeaderName {
         let bytes = src.as_bytes();
-        #[allow(deprecated)]
-        let mut buf = unsafe { mem::uninitialized() };
+        let mut buf = uninit_u8_array();
+        // Precondition: HEADER_CHARS_H2 is a valid table for parse_hdr()
         match parse_hdr(bytes, &mut buf, &HEADER_CHARS_H2) {
             Ok(hdr_name) => match hdr_name.inner {
                 Repr::Standard(std) => std.into(),
@@ -2012,8 +2108,10 @@ impl Error for InvalidHeaderName {}
 // ===== HdrName =====
 
 impl<'a> HdrName<'a> {
+    // Precondition: if lower then buf is valid UTF-8
     fn custom(buf: &'a [u8], lower: bool) -> HdrName<'a> {
         HdrName {
+            // Invariant (on MaybeLower): follows from the precondition
             inner: Repr::Custom(MaybeLower {
                 buf: buf,
                 lower: lower,
@@ -2021,24 +2119,22 @@ impl<'a> HdrName<'a> {
         }
     }
 
-    #[allow(deprecated)]
     pub fn from_bytes<F, U>(hdr: &[u8], f: F) -> Result<U, InvalidHeaderName>
         where F: FnOnce(HdrName<'_>) -> U,
     {
-        #[allow(deprecated)]
-        let mut buf = unsafe { mem::uninitialized() };
+        let mut buf = uninit_u8_array();
+        // Precondition: HEADER_CHARS is a valid table for parse_hdr().
         let hdr = parse_hdr(hdr, &mut buf, &HEADER_CHARS)?;
         Ok(f(hdr))
     }
 
-    #[allow(deprecated)]
     pub fn from_static<F, U>(hdr: &'static str, f: F) -> U
     where
         F: FnOnce(HdrName<'_>) -> U,
     {
-        #[allow(deprecated)]
-        let mut buf = unsafe { mem::uninitialized() };
+        let mut buf = uninit_u8_array();
         let hdr =
+            // Precondition: HEADER_CHARS is a valid table for parse_hdr().
             parse_hdr(hdr.as_bytes(), &mut buf, &HEADER_CHARS).expect("static str is invalid name");
         f(hdr)
     }
@@ -2054,6 +2150,7 @@ impl<'a> From<HdrName<'a>> for HeaderName {
             Repr::Custom(maybe_lower) => {
                 if maybe_lower.lower {
                     let buf = Bytes::copy_from_slice(&maybe_lower.buf[..]);
+                    // Safety: the invariant on MaybeLower ensures buf is valid UTF-8.
                     let byte_str = unsafe { ByteStr::from_utf8_unchecked(buf) };
 
                     HeaderName {
@@ -2064,9 +2161,14 @@ impl<'a> From<HdrName<'a>> for HeaderName {
                     let mut dst = BytesMut::with_capacity(maybe_lower.buf.len());
 
                     for b in maybe_lower.buf.iter() {
+                        // HEADER_CHARS maps each byte to a valid single-byte UTF-8
+                        // codepoint.
                         dst.put_u8(HEADER_CHARS[*b as usize]);
                     }
 
+                    // Safety: the loop above maps each byte of maybe_lower.buf to a
+                    // valid single-byte UTF-8 codepoint before copying it into dst.
+                    // dst (and hence dst.freeze()) is thus valid UTF-8.
                     let buf = unsafe { ByteStr::from_utf8_unchecked(dst.freeze()) };
 
                     HeaderName {
@@ -2135,6 +2237,25 @@ fn eq_ignore_ascii_case(lower: &[u8], s: &[u8]) -> bool {
     lower.iter().zip(s).all(|(a, b)| {
         *a == HEADER_CHARS[*b as usize]
     })
+}
+
+// Utility functions for MaybeUninit<>. These are drawn from unstable API's on 
+// MaybeUninit<> itself.
+const SCRATCH_BUF_SIZE: usize = 64;
+
+fn uninit_u8_array() -> [MaybeUninit<u8>; SCRATCH_BUF_SIZE] {
+    let arr = MaybeUninit::<[MaybeUninit<u8>; SCRATCH_BUF_SIZE]>::uninit();
+    // Safety: assume_init() is claiming that an array of MaybeUninit<> 
+    // has been initilized, but MaybeUninit<>'s do not require initilizaton.
+    unsafe { arr.assume_init() }
+}
+
+// Assuming all the elements are initilized, get a slice of them.
+//
+// Safety: All elements of `slice` must be initilized to prevent
+// undefined behavior.
+unsafe fn slice_assume_init<T>(slice: &[MaybeUninit<T>]) -> &[T] {
+        &*(slice as *const [MaybeUninit<T>] as *const [T])
 }
 
 #[cfg(test)]
