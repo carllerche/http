@@ -372,7 +372,7 @@ impl From<HeaderName> for HeaderValue {
     #[inline]
     fn from(h: HeaderName) -> HeaderValue {
         HeaderValue {
-            inner: h.into_bytes(),
+            inner: h.into(),
             is_sensitive: false,
         }
     }
@@ -490,6 +490,13 @@ impl FromStr for HeaderValue {
     }
 }
 
+impl From<HeaderValue> for Bytes {
+    #[inline]
+    fn from(value: HeaderValue) -> Bytes {
+        value.inner
+    }
+}
+
 impl<'a> From<&'a HeaderValue> for HeaderValue {
     #[inline]
     fn from(t: &'a HeaderValue) -> Self {
@@ -538,6 +545,15 @@ impl TryFrom<Vec<u8>> for HeaderValue {
     #[inline]
     fn try_from(vec: Vec<u8>) -> Result<Self, Self::Error> {
         HeaderValue::from_shared(vec.into())
+    }
+}
+
+impl TryFrom<Bytes> for HeaderValue {
+    type Error = InvalidHeaderValue;
+
+    #[inline]
+    fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
+        HeaderValue::from_shared(bytes)
     }
 }
 

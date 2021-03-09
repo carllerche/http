@@ -118,14 +118,14 @@ macro_rules! standard_headers {
                 // Test lower case
                 let name_bytes = name.as_bytes();
                 let bytes: Bytes =
-                    HeaderName::from_bytes(name_bytes).unwrap().inner.into();
+                    HeaderName::from_bytes(name_bytes).unwrap().into();
                 assert_eq!(bytes, name_bytes);
                 assert_eq!(HeaderName::from_bytes(name_bytes).unwrap(), std);
 
                 // Test upper case
                 let upper = name.to_uppercase().to_string();
                 let bytes: Bytes =
-                    HeaderName::from_bytes(upper.as_bytes()).unwrap().inner.into();
+                    HeaderName::from_bytes(upper.as_bytes()).unwrap().into();
                 assert_eq!(bytes, name.as_bytes());
                 assert_eq!(HeaderName::from_bytes(upper.as_bytes()).unwrap(),
                            std);
@@ -1800,10 +1800,6 @@ impl HeaderName {
             Repr::Custom(ref v) => &*v.0,
         }
     }
-
-    pub(super) fn into_bytes(self) -> Bytes {
-        self.inner.into()
-    }
 }
 
 impl FromStr for HeaderName {
@@ -1876,6 +1872,13 @@ impl From<Custom> for Bytes {
     }
 }
 
+impl From<HeaderName> for Bytes {
+    #[inline]
+    fn from(name: HeaderName) -> Bytes {
+        name.inner.into()
+    }
+}
+
 impl<'a> TryFrom<&'a str> for HeaderName {
     type Error = InvalidHeaderName;
     #[inline]
@@ -1897,6 +1900,14 @@ impl<'a> TryFrom<&'a [u8]> for HeaderName {
     #[inline]
     fn try_from(s: &'a [u8]) -> Result<Self, Self::Error> {
         Self::from_bytes(s)
+    }
+}
+
+impl TryFrom<Bytes> for HeaderName {
+    type Error = InvalidHeaderName;
+    #[inline]
+    fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
+        Self::from_bytes(bytes.as_ref())
     }
 }
 
