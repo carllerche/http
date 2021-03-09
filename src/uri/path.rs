@@ -17,79 +17,6 @@ pub struct PathAndQuery {
 const NONE: u16 = ::std::u16::MAX;
 
 impl PathAndQuery {
-    // Not public while `bytes` is unstable.
-    pub(super) fn from_shared(mut src: Bytes) -> Result<Self, InvalidUri> {
-        let mut query = NONE;
-        let mut fragment = None;
-
-        // block for iterator borrow
-        {
-            let mut iter = src.as_ref().iter().enumerate();
-
-            // path ...
-            for (i, &b) in &mut iter {
-                // See https://url.spec.whatwg.org/#path-state
-                match b {
-                    b'?' => {
-                        debug_assert_eq!(query, NONE);
-                        query = i as u16;
-                        break;
-                    }
-                    b'#' => {
-                        fragment = Some(i);
-                        break;
-                    }
-
-                    // This is the range of bytes that don't need to be
-                    // percent-encoded in the path. If it should have been
-                    // percent-encoded, then error.
-                    0x21 |
-                    0x24..=0x3B |
-                    0x3D |
-                    0x40..=0x5F |
-                    0x61..=0x7A |
-                    0x7C |
-                    0x7E => {},
-
-                    _ => return Err(ErrorKind::InvalidUriChar.into()),
-                }
-            }
-
-            // query ...
-            if query != NONE {
-                for (i, &b) in iter {
-                    match b {
-                        // While queries *should* be percent-encoded, most
-                        // bytes are actually allowed...
-                        // See https://url.spec.whatwg.org/#query-state
-                        //
-                        // Allowed: 0x21 / 0x24 - 0x3B / 0x3D / 0x3F - 0x7E
-                        0x21 |
-                        0x24..=0x3B |
-                        0x3D |
-                        0x3F..=0x7E => {},
-
-                        b'#' => {
-                            fragment = Some(i);
-                            break;
-                        }
-
-                        _ => return Err(ErrorKind::InvalidUriChar.into()),
-                    }
-                }
-            }
-        }
-
-        if let Some(i) = fragment {
-            src.truncate(i);
-        }
-
-        Ok(PathAndQuery {
-            data: unsafe { ByteStr::from_utf8_unchecked(src) },
-            query: query,
-        })
-    }
-
     /// Convert a `PathAndQuery` from a static string.
     ///
     /// This function will not perform any copying, however the string is
@@ -112,7 +39,7 @@ impl PathAndQuery {
     pub fn from_static(src: &'static str) -> Self {
         let src = Bytes::from_static(src.as_bytes());
 
-        PathAndQuery::from_shared(src).unwrap()
+        PathAndQuery::try_from(src).unwrap()
     }
 
     /// Attempt to convert a `Bytes` buffer to a `PathAndQuery`.
@@ -124,7 +51,7 @@ impl PathAndQuery {
         T: AsRef<[u8]> + 'static,
     {
         if_downcast_into!(T, Bytes, src, {
-            return PathAndQuery::from_shared(src);
+            return PathAndQuery::try_from(src);
         });
 
         PathAndQuery::try_from(src.as_ref())
@@ -263,11 +190,87 @@ impl PathAndQuery {
     }
 }
 
+impl TryFrom<Bytes> for PathAndQuery {
+    type Error = InvalidUri;
+    #[inline]
+    fn try_from(mut s: Bytes) -> Result<Self, Self::Error> {
+        let mut query = NONE;
+        let mut fragment = None;
+
+        // block for iterator borrow
+        {
+            let mut iter = s.as_ref().iter().enumerate();
+
+            // path ...
+            for (i, &b) in &mut iter {
+                // See https://url.spec.whatwg.org/#path-state
+                match b {
+                    b'?' => {
+                        debug_assert_eq!(query, NONE);
+                        query = i as u16;
+                        break;
+                    }
+                    b'#' => {
+                        fragment = Some(i);
+                        break;
+                    }
+
+                    // This is the range of bytes that don't need to be
+                    // percent-encoded in the path. If it should have been
+                    // percent-encoded, then error.
+                    0x21 |
+                    0x24..=0x3B |
+                    0x3D |
+                    0x40..=0x5F |
+                    0x61..=0x7A |
+                    0x7C |
+                    0x7E => {},
+
+                    _ => return Err(ErrorKind::InvalidUriChar.into()),
+                }
+            }
+
+            // query ...
+            if query != NONE {
+                for (i, &b) in iter {
+                    match b {
+                        // While queries *should* be percent-encoded, most
+                        // bytes are actually allowed...
+                        // See https://url.spec.whatwg.org/#query-state
+                        //
+                        // Allowed: 0x21 / 0x24 - 0x3B / 0x3D / 0x3F - 0x7E
+                        0x21 |
+                        0x24..=0x3B |
+                        0x3D |
+                        0x3F..=0x7E => {},
+
+                        b'#' => {
+                            fragment = Some(i);
+                            break;
+                        }
+
+                        _ => return Err(ErrorKind::InvalidUriChar.into()),
+                    }
+                }
+            }
+        }
+
+        if let Some(i) = fragment {
+            s.truncate(i);
+        }
+
+        Ok(PathAndQuery {
+            data: unsafe { ByteStr::from_utf8_unchecked(s) },
+            query: query,
+        })
+    }
+}
+
 impl<'a> TryFrom<&'a [u8]> for PathAndQuery {
     type Error = InvalidUri;
     #[inline]
     fn try_from(s: &'a [u8]) -> Result<Self, Self::Error> {
-        PathAndQuery::from_shared(Bytes::copy_from_slice(s))
+        PathAndQuery::try_from(Bytes::copy_from_slice(s))
     }
 }
 
@@ -300,6 +303,12 @@ impl FromStr for PathAndQuery {
     #[inline]
     fn from_str(s: &str) -> Result<Self, InvalidUri> {
         TryFrom::try_from(s)
+    }
+}
+
+impl From<PathAndQuery> for Bytes {
+    fn from(src: PathAndQuery) -> Bytes {
+        src.data.into()
     }
 }
 
